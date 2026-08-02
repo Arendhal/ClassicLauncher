@@ -42,17 +42,23 @@ Le code est disponible sous forme de **Projet Xcode classique** (`.xcodeproj`) t
 
 ---
 
-## 🚀 Comment l'utiliser / Compiler
+## 🚀 Installation & Utilisation
 
-### Option 1 : Via Xcode (Recommandé)
-1. Ouvrez `ClassicLauncher.xcodeproj` dans **Xcode**.
+### Option 1 : Via l'Installateur macOS (DMG) - Recommandé pour l'utilisateur
+Un fichier d'installation autonome prêt à l'emploi est inclus :
+1. Téléchargez ou ouvrez `ClassicLauncher-1.5-Installer.dmg`.
+2. Glissez simplement l'icône **Classic Launcher** dans votre dossier *Applications*.
+3. Au premier lancement, vous pouvez définir Classic Launcher comme votre lanceur par défaut et l'autoriser à démarrer en arrière-plan avec votre Mac.
+
+### Option 2 : Compilation depuis Apple Xcode (Développement)
+1. Ouvrez `ClassicLauncher.xcodeproj` dans **Xcode 15+**.
 2. Lancez l'application en cliquant sur le bouton **Run** (`Cmd + R`).
 3. Pour remplacer définitivement le Launchpad : Dans la barre des menus macOS de l'application, cliquez sur **Configuration** > **Définir comme lanceur d'apps par défaut**. Autorisez l'accès à l'Accessibilité dans les Réglages Système si demandé.
 
-### Option 2 : Via Swift Package Manager (Terminal)
+### Option 3 : Via Swift Package Manager (Terminal)
 Vous pouvez lancer l'application en ligne de commande pour le développement rapide :
 ```bash
-cd /chemin/vers/ClassicLauncher
+cd /Users/benjaminleguen/Dev/Swift/ClassicLauncher
 swift run
 ```
 
