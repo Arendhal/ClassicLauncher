@@ -187,24 +187,48 @@ class AppScanner: ObservableObject {
         query?.start()
     }
     
+    /// Empreinte (chemins triés) du dernier résultat traité, pour ignorer les mises à jour sans effet.
+    private var lastSignature: [String] = []
+    private let processingQueue = DispatchQueue(label: "ClassicLauncher.AppScanner", qos: .utility)
+
     @objc private func queryUpdated(_ notification: Notification) {
-        query?.disableUpdates()
-        defer { query?.enableUpdates() }
-        
-        guard let results = query?.results as? [NSMetadataItem] else { return }
-        
+        guard let query = query else { return }
+
+        // Lecture rapide des résultats sur le main thread (exigé par NSMetadataQuery) :
+        // uniquement chemins et noms, aucun chargement d'icône ici.
+        query.disableUpdates()
+        var entries: [(path: String, displayName: String?)] = []
+        for case let item as NSMetadataItem in query.results {
+            guard let path = item.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
+            let url = URL(fileURLWithPath: path)
+            guard isInTrustedDirectory(url), !isInternalHelper(url) else { continue }
+            entries.append((path, item.value(forAttribute: NSMetadataItemDisplayNameKey) as? String))
+        }
+        query.enableUpdates()
+
+        // Lancer une app met à jour ses métadonnées Spotlight (date de dernière utilisation…) et
+        // déclenche une notification : si la liste des apps n'a pas changé, on ne refait rien.
+        let signature = entries.map { $0.path }.sorted()
+        guard signature != lastSignature else { return }
+        lastSignature = signature
+
+        processingQueue.async { [weak self] in
+            self?.buildAppList(from: entries, signature: signature)
+        }
+    }
+
+    /// Chargement des icônes / noms et tri, hors du main thread.
+    private func buildAppList(from entries: [(path: String, displayName: String?)], signature: [String]) {
         let ws = NSWorkspace.shared
         let fm = FileManager.default
         var loaded: [AppItem] = []
-        
-        for item in results {
-            guard let path = item.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
+
+        for entry in entries {
+            let path = entry.path
             let url = URL(fileURLWithPath: path)
-            guard isInTrustedDirectory(url) else { continue }
-            guard !isInternalHelper(url) else { continue }
-            
+
             var name = url.deletingPathExtension().lastPathComponent
-            if let loc = item.value(forAttribute: NSMetadataItemDisplayNameKey) as? String {
+            if let loc = entry.displayName {
                 var n = loc
                 if n.hasSuffix(".app") { n = String(n.dropLast(4)) }
                 name = n
@@ -213,10 +237,10 @@ class AppScanner: ObservableObject {
                 if !dn.isEmpty && dn != url.lastPathComponent { name = dn }
                 if name.hasSuffix(".app") { name = String(name.dropLast(4)) }
             }
-            
+
             loaded.append(AppItem(name: name, url: url, icon: ws.icon(forFile: path), isLegacy: false))
         }
-        
+
         // Apps legacy
         var legacyNames: [String] = []
         let legacyDir = URL(fileURLWithPath: "/System/Library/CoreServices/Applications")
@@ -239,6 +263,8 @@ class AppScanner: ObservableObject {
         let sorted = uniqueByName.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         
         DispatchQueue.main.async {
+            // Un scan plus récent a été lancé entre-temps : ce résultat est obsolète
+            guard signature == self.lastSignature else { return }
             let currentNames = self.installedApps.map { $0.name }
             let newNames = sorted.map { $0.name }
             if currentNames != newNames {
@@ -310,7 +336,6 @@ class AppLoader: ObservableObject {
     @Published var folders: [AppFolder] = [] { didSet { DataManager.shared.data.folders = folders; DataManager.shared.save() } }
     @Published var isLoading = true
     @Published var searchText = ""
-    @Published var isLaunching = false
     @Published var isJiggleMode = false // Mode édition
     
     @Published var sortOption: SortOption { didSet { UserDefaults.standard.set(sortOption.rawValue, forKey: "SortOptionChoice") } }
@@ -489,12 +514,26 @@ class AppLoader: ObservableObject {
     }
     
     func launchApp(_ app: AppItem) {
-        isLaunching = true
-        openFolderID = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            NSWorkspace.shared.open(app.url)
-            NSApp.hide(nil)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.isLaunching = false }
+        if openFolderID != nil { openFolderID = nil }
+
+        // On cède le premier plan à l'app lancée AVANT de se masquer (activation coopérative macOS 14+)
+        if let bundleID = Bundle(url: app.url)?.bundleIdentifier {
+            NSApp.yieldActivation(toApplicationWithBundleIdentifier: bundleID)
+        }
+
+        // Lancement asynchrone : ne bloque jamais le main thread, même si l'app lancée
+        // (ou Gatekeeper) affiche une fenêtre d'attente / de confirmation.
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = true
+        NSWorkspace.shared.openApplication(at: app.url, configuration: config) { _, error in
+            if let error = error { print("Échec du lancement de \(app.name) : \(error.localizedDescription)") }
+        }
+
+        // Disparition immédiate, animée par le WindowServer (pas de re-rendu SwiftUI de la grille)
+        LauncherWindow.dismiss { [weak self] in
+            guard let self = self else { return }
+            // Remise à zéro pendant que le launcher est masqué : la réouverture est instantanée
+            if !self.searchText.isEmpty { self.searchText = "" }
         }
     }
     

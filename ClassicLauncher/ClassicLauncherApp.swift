@@ -135,46 +135,112 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         maximizeWindow()
-        if let window = NSApplication.shared.windows.first {
+        if let window = LauncherWindow.main {
             window.makeKeyAndOrderFront(nil)
         }
         return true
     }
-    
+
     func applicationDidBecomeActive(_ notification: Notification) {
         // Masque la barre des menus pour occuper tout l'écran (requiert de masquer le dock)
         NSApp.presentationOptions = [.hideMenuBar, .hideDock]
-        if let window = NSApplication.shared.windows.first {
-            window.level = .popUpMenu
-        }
+        LauncherWindow.main?.level = .popUpMenu
         maximizeWindow()
     }
-    
+
     func applicationDidResignActive(_ notification: Notification) {
         // Restaure la barre des menus dès qu'on quitte le focus
-        NSApp.presentationOptions = []
-        if let window = NSApplication.shared.windows.first {
-            window.level = .normal
-        }
+        LauncherWindow.releaseScreen()
         // Comportement "Launchpad" : si on clique en dehors, on masque le launcher
         if UserDefaults.standard.bool(forKey: "HideOnDeactivate") {
             NSApp.hide(nil)
         }
     }
-    
+
     private func maximizeWindow() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            guard let window = NSApplication.shared.windows.first,
-                  let screen = NSScreen.main else { return }
-            
-            // Permet à la fenêtre de dessiner son contenu sous l'encoche (safe area)
+        // Au démarrage la fenêtre SwiftUI n'existe pas encore : on réessaie au tour suivant
+        guard let window = LauncherWindow.main else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.maximizeWindow() }
+            return
+        }
+        guard let screen = NSScreen.main else { return }
+
+        // Permet à la fenêtre de dessiner son contenu sous l'encoche (safe area)
+        if !window.styleMask.contains(.fullSizeContentView) {
             window.styleMask.insert(.fullSizeContentView)
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            
-            // Utilise screen.frame (plein écran incluant la zone de la barre des menus et l'encoche)
+        }
+
+        // Utilise screen.frame (plein écran incluant la zone de la barre des menus et l'encoche).
+        // Uniquement si nécessaire : un setFrame force une passe de layout de toute la grille.
+        if window.frame != screen.frame {
             window.setFrame(screen.frame, display: true, animate: false)
         }
+    }
+}
+
+// MARK: - Launcher Window
+
+/// Point d'accès unique à la fenêtre plein écran du launcher et à son animation de disparition.
+enum LauncherWindow {
+    static var main: NSWindow? { NSApplication.shared.windows.first }
+
+    private static let dismissDuration: CFTimeInterval = 0.18
+    private static let zoomKey = "launcherDismissZoom"
+    private static var isDismissing = false
+
+    /// Rend l'écran : niveau de fenêtre normal + barre des menus / Dock restaurés.
+    /// Indispensable avant de lancer une app, sinon ses fenêtres (dialogue Gatekeeper,
+    /// fenêtre d'attente…) s'ouvrent SOUS le launcher en niveau .popUpMenu.
+    static func releaseScreen() {
+        if !NSApp.presentationOptions.isEmpty { NSApp.presentationOptions = [] }
+        if let window = main, window.level != .normal { window.level = .normal }
+    }
+
+    /// Fait disparaître le launcher (fondu + léger zoom) puis masque l'application.
+    /// L'animation est composée par le WindowServer / Core Animation : la hiérarchie SwiftUI
+    /// n'est pas re-rendue image par image, contrairement à un .scaleEffect/.opacity.
+    static func dismiss(completion: (() -> Void)? = nil) {
+        releaseScreen()
+        guard let window = main, window.isVisible, !NSApp.isHidden, !isDismissing else {
+            if !NSApp.isHidden { NSApp.hide(nil) }
+            completion?()
+            return
+        }
+        isDismissing = true
+        window.ignoresMouseEvents = true
+
+        if let layer = window.contentView?.layer {
+            // Les layers des NSView ont leur anchorPoint en (0,0) : on zoome autour du centre
+            let b = layer.bounds
+            var t = CATransform3DMakeTranslation(-b.midX, -b.midY, 0)
+            t = CATransform3DConcat(t, CATransform3DMakeScale(1.12, 1.12, 1))
+            t = CATransform3DConcat(t, CATransform3DMakeTranslation(b.midX, b.midY, 0))
+
+            let zoom = CABasicAnimation(keyPath: "transform")
+            zoom.fromValue = CATransform3DIdentity
+            zoom.toValue = t
+            zoom.duration = dismissDuration
+            zoom.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            zoom.fillMode = .forwards
+            zoom.isRemovedOnCompletion = false
+            layer.add(zoom, forKey: zoomKey)
+        }
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = dismissDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().alphaValue = 0
+        }, completionHandler: {
+            if !NSApp.isHidden { NSApp.hide(nil) }
+            // Remise à l'état initial une fois la fenêtre hors écran (aucun flash visible)
+            window.contentView?.layer?.removeAnimation(forKey: zoomKey)
+            window.alphaValue = 1
+            window.ignoresMouseEvents = false
+            isDismissing = false
+            completion?()
+        })
     }
 }
 
@@ -182,39 +248,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 class HotKeyManager {
     static let shared = HotKeyManager()
-    
+
+    /// Contexte transmis au callback C via `refcon` (le callback ne peut rien capturer).
+    /// Immuable pendant la vie du tap : lecture sans verrou depuis le thread du tap.
+    private final class TapContext {
+        let shortcut: ShortcutType
+        var tap: CFMachPort?
+        init(shortcut: ShortcutType) { self.shortcut = shortcut }
+    }
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var tapRunLoop: CFRunLoop?
+    private var context: TapContext?
     private var isIntercepting = false
-    
+
     func start() {
         guard !isIntercepting else { return }
-        
+
         // Vérifie les droits d'accessibilité (et affiche la demande système si besoin)
         let options: NSDictionary = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         let accessEnabled = AXIsProcessTrustedWithOptions(options)
-        
+
         if !accessEnabled {
             print("Accessibilité non accordée. L'alerte système devrait apparaître.")
             return
         }
-        
+
         // On écoute les touches standard et les touches média système
         let eventMask = (1 << CGEventType.keyDown.rawValue) | (1 << 14) // 14 = NSSystemDefined
-        
+
+        let ctx = TapContext(shortcut: DataManager.shared.data.activeShortcut)
+
         eventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: CGEventMask(eventMask),
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                
+                guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+                let ctx = Unmanaged<TapContext>.fromOpaque(refcon).takeUnretainedValue()
+
+                // 0. macOS désactive le tap s'il a répondu trop lentement : on le réactive
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = ctx.tap { CGEvent.tapEnable(tap: tap, enable: true) }
+                    return Unmanaged.passUnretained(event)
+                }
+
                 // 1. Intercepter le raccourci personnalisé
                 if type == .keyDown {
                     let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
                     let flags = event.flags
-                    let activeShortcut = DataManager.shared.data.activeShortcut
-                    
+                    let activeShortcut = ctx.shortcut
+
                     var isMatch = false
                     
                     switch activeShortcut {
@@ -252,28 +338,55 @@ class HotKeyManager {
                     }
                 }
                 
-                return Unmanaged.passRetained(event)
+                // passUnretained : on rend l'événement reçu tel quel (passRetained le faisait fuiter à chaque frappe)
+                return Unmanaged.passUnretained(event)
             },
-            userInfo: nil
+            userInfo: Unmanaged.passUnretained(ctx).toOpaque()
         )
-        
-        if let tap = eventTap {
-            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-            isIntercepting = true
+
+        guard let tap = eventTap,
+              let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+            eventTap = nil
+            return
         }
+        ctx.tap = tap
+        context = ctx
+        runLoopSource = source
+
+        // Le tap tourne sur son propre thread : un main thread occupé (rendu SwiftUI, scan des apps…)
+        // ne peut plus retarder les frappes clavier de tout le système ni faire désactiver le tap.
+        let ready = DispatchSemaphore(value: 0)
+        let thread = Thread { [weak self] in
+            let runLoop = CFRunLoopGetCurrent()
+            self?.tapRunLoop = runLoop
+            CFRunLoopAddSource(runLoop, source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            ready.signal()
+            CFRunLoopRun() // Rend la main quand stop() retire la source / arrête la boucle
+        }
+        thread.name = "ClassicLauncher.HotKeyTap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        ready.wait()
+        isIntercepting = true
     }
-    
+
     func stop() {
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
-            if let source = runLoopSource {
-                CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            if let runLoop = tapRunLoop {
+                if let source = runLoopSource {
+                    CFRunLoopRemoveSource(runLoop, source, .commonModes)
+                }
+                CFRunLoopStop(runLoop)
             }
+            CFMachPortInvalidate(tap)
             eventTap = nil
             runLoopSource = nil
+            tapRunLoop = nil
         }
+        // `context` est volontairement conservé jusqu'au prochain start() : un callback encore
+        // en vol sur le thread du tap peut y accéder sans risque d'accès à une zone libérée.
         isIntercepting = false
     }
     
@@ -283,9 +396,7 @@ class HotKeyManager {
                 NSApp.unhide(nil)
             }
             NSApp.activate(ignoringOtherApps: true)
-            if let window = NSApplication.shared.windows.first {
-                window.makeKeyAndOrderFront(nil)
-            }
+            LauncherWindow.main?.makeKeyAndOrderFront(nil)
         }
     }
 }

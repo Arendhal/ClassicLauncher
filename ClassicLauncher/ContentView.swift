@@ -191,10 +191,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .scaleEffect(appLoader.isLaunching ? 1.5 : 1.0)
-            .opacity(appLoader.isLaunching ? 0.0 : 1.0)
-            .animation(.timingCurve(0.2, 0.8, 0.2, 1, duration: 0.35), value: appLoader.isLaunching)
-            
+
             // Overlay du dossier ouvert
             if let folderID = appLoader.openFolderID,
                let folder = appLoader.getFolder(byID: folderID) {
@@ -221,8 +218,9 @@ struct ContentView: View {
         }
         // Fix #1 : Vider la recherche quand l'app reprend le focus
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            appLoader.searchText = ""
-            focusedItemIndex = nil
+            // Garde : réassigner la même valeur déclenche quand même un re-rendu de toute la grille
+            if !appLoader.searchText.isEmpty { appLoader.searchText = "" }
+            if focusedItemIndex != nil { focusedItemIndex = nil }
         }
         // Fix #2 : Navigation clavier TAB / ENTRÉE
         .background(
@@ -258,13 +256,23 @@ struct ContentView: View {
                     }
                 }
                 
-                // ÉCHAP : vider la recherche
+                // ÉCHAP : on dépile un niveau à chaque appui (mode édition → dossier → recherche),
+                // puis on ferme le launcher
                 if event.keyCode == 53 { // Escape
-                    if !appLoader.searchText.isEmpty {
+                    // Une feuille (réglages, détails) gère elle-même Échap
+                    guard !showSettings, selectedAppDetails == nil else { return false }
+                    if appLoader.isJiggleMode {
+                        withAnimation { appLoader.isJiggleMode = false }
+                    } else if appLoader.openFolderID != nil {
+                        appLoader.isEditingFolderName = false
+                        appLoader.openFolderID = nil
+                    } else if !appLoader.searchText.isEmpty {
                         appLoader.searchText = ""
                         focusedItemIndex = nil
-                        return true
+                    } else {
+                        LauncherWindow.dismiss()
                     }
+                    return true
                 }
                 
                 return false
